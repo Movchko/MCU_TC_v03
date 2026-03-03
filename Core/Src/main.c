@@ -81,14 +81,26 @@ static void FDCAN_StartAll(void)
   sFilter.FilterID1 = 0x00000000u;
   sFilter.FilterID2 = 0x00000000u;
 
-  HAL_FDCAN_ConfigFilter(&hfdcan1, &sFilter);
-  HAL_FDCAN_ConfigFilter(&hfdcan2, &sFilter);
+ // HAL_FDCAN_ConfigFilter(&hfdcan1, &sFilter);
+ // HAL_FDCAN_ConfigFilter(&hfdcan2, &sFilter);
 
   HAL_FDCAN_Start(&hfdcan1);
   HAL_FDCAN_Start(&hfdcan2);
 
-  HAL_FDCAN_ActivateNotification(&hfdcan1, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0);
-  HAL_FDCAN_ActivateNotification(&hfdcan2, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0);
+  /* Приём + ошибки (как в ППКУ) */
+  HAL_FDCAN_ActivateNotification(&hfdcan1,
+                                 FDCAN_IT_RX_FIFO0_NEW_MESSAGE |
+                                 FDCAN_IT_BUS_OFF |
+                                 FDCAN_IT_ERROR_WARNING |
+                                 FDCAN_IT_ERROR_PASSIVE,
+                                 0);
+
+  HAL_FDCAN_ActivateNotification(&hfdcan2,
+                                 FDCAN_IT_RX_FIFO0_NEW_MESSAGE |
+                                 FDCAN_IT_BUS_OFF |
+                                 FDCAN_IT_ERROR_WARNING |
+                                 FDCAN_IT_ERROR_PASSIVE,
+                                 0);
 }
 
 void USBSendData(uint8_t *Buf)
@@ -115,6 +127,7 @@ void CANSendData(uint8_t *Buf)
   txHeader.MessageMarker = 0;
 
   HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan1, &txHeader, &Buf[4]);
+  HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan2, &txHeader, &Buf[4]);
 }
 
 void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
@@ -138,8 +151,10 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
 
     if (hfdcan == &hfdcan1) {
       other = &hfdcan2;
+      App_CanOnRx(1u);
     } else {
       other = &hfdcan1;
+      App_CanOnRx(2u);
     }
 
     txHeader.Identifier = rxHeader.Identifier;
@@ -156,6 +171,31 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
   }
 
   App_CanRxPush(rxHeader.Identifier, data);
+}
+
+/**
+  * @brief Обработка смены статуса ошибок FDCAN (BusOff и др.).
+  *        Аналогично реализации в ППКУ: при BusOff выполняем корректный выход.
+  */
+void HAL_FDCAN_ErrorStatusCallback(FDCAN_HandleTypeDef *hfdcan, uint32_t ErrorStatusITs)
+{
+  if ((ErrorStatusITs & FDCAN_IT_BUS_OFF) != RESET) {
+    FDCAN_ProtocolStatusTypeDef protocolStatus = {};
+    HAL_FDCAN_GetProtocolStatus(hfdcan, &protocolStatus);
+    if (protocolStatus.BusOff) {
+      uint16_t try_cnt = 0xFFFF;
+
+      /* Вход в INIT */
+      SET_BIT(hfdcan->Instance->CCCR, FDCAN_CCCR_INIT);
+      while (((hfdcan->Instance->CCCR & FDCAN_CCCR_INIT) == 0U) && (try_cnt--)) {
+      }
+
+      /* Выход из INIT */
+      CLEAR_BIT(hfdcan->Instance->CCCR, FDCAN_CCCR_INIT);
+      while (((hfdcan->Instance->CCCR & FDCAN_CCCR_INIT) != 0U) && (try_cnt--)) {
+      }
+    }
+  }
 }
 
 /* USER CODE END 0 */
@@ -375,10 +415,10 @@ static void MX_FDCAN1_Init(void)
   hfdcan1.Init.NominalTimeSeg2 = 1;
   hfdcan1.Init.DataPrescaler = 1;
   hfdcan1.Init.DataSyncJumpWidth = 1;
-  hfdcan1.Init.DataTimeSeg1 = 1;
+  hfdcan1.Init.DataTimeSeg1 = 21;
   hfdcan1.Init.DataTimeSeg2 = 1;
-  hfdcan1.Init.StdFiltersNbr = 0;
-  hfdcan1.Init.ExtFiltersNbr = 0;
+  hfdcan1.Init.StdFiltersNbr = 1;
+  hfdcan1.Init.ExtFiltersNbr = 1;
   hfdcan1.Init.TxFifoQueueMode = FDCAN_TX_FIFO_OPERATION;
   if (HAL_FDCAN_Init(&hfdcan1) != HAL_OK)
   {
@@ -418,10 +458,10 @@ static void MX_FDCAN2_Init(void)
   hfdcan2.Init.NominalTimeSeg2 = 1;
   hfdcan2.Init.DataPrescaler = 1;
   hfdcan2.Init.DataSyncJumpWidth = 1;
-  hfdcan2.Init.DataTimeSeg1 = 1;
+  hfdcan2.Init.DataTimeSeg1 = 21;
   hfdcan2.Init.DataTimeSeg2 = 1;
-  hfdcan2.Init.StdFiltersNbr = 0;
-  hfdcan2.Init.ExtFiltersNbr = 0;
+  hfdcan2.Init.StdFiltersNbr = 1;
+  hfdcan2.Init.ExtFiltersNbr = 1;
   hfdcan2.Init.TxFifoQueueMode = FDCAN_TX_FIFO_OPERATION;
   if (HAL_FDCAN_Init(&hfdcan2) != HAL_OK)
   {
