@@ -39,6 +39,12 @@ static AppCanRxEntry can_rx_ring[APP_CAN_RX_RING_SIZE];
 static volatile uint8_t can_rx_head = 0;
 static volatile uint8_t can_rx_tail = 0;
 
+/* Флаги активности шин CAN: 1 - были пакеты за последние 2 секунды, 0 - тишина */
+volatile uint8_t CAN1_Active = 0;
+volatile uint8_t CAN2_Active = 0;
+static uint32_t can1_last_rx_tick = 0;
+static uint32_t can2_last_rx_tick = 0;
+
 /* callback статуса: отправляем его через CAN по протоколу backend */
 static void VDeviceSetStatus(uint8_t DNum, uint8_t Code, const uint8_t *Parameters) {
     uint8_t data[7] = {0};
@@ -185,6 +191,18 @@ void ListenerCommandCB(uint32_t MsgID, uint8_t *MsgData)
     (void)MsgData;
 }
 
+void App_CanOnRx(uint8_t bus)
+{
+    uint32_t now = HAL_GetTick();
+    if (bus == 1u) {
+        CAN1_Active = 1u;
+        can1_last_rx_tick = now;
+    } else if (bus == 2u) {
+        CAN2_Active = 1u;
+        can2_last_rx_tick = now;
+    }
+}
+
 void App_CanRxPush(uint32_t id, const uint8_t *data)
 {
     uint8_t next = static_cast<uint8_t>(can_rx_head + 1u);
@@ -291,11 +309,33 @@ void App_Timer1ms(void)
        // HAL_GPIO_TogglePin(LINE1_EN_GPIO_Port, LINE1_EN_Pin);
     }
 
+    /* Обновляем флаги активности CAN: если 2 секунды тишина — считаем шину неактивной */
+    App_UpdateCanActivity();
+
     /* Обновление виртуального ДПТ (1 мс таймер) */
     g_dpt.Timer1ms();
 
     App_CanProcess();
     BackendProcess();
+}
+
+void App_UpdateCanActivity(void)
+{
+    uint32_t now = HAL_GetTick();
+
+    if (can1_last_rx_tick != 0u) {
+        if ((now - can1_last_rx_tick) >= 2000u) {
+            CAN1_Active = 0u;
+            can1_last_rx_tick = 0u;
+        }
+    }
+
+    if (can2_last_rx_tick != 0u) {
+        if ((now - can2_last_rx_tick) >= 2000u) {
+            CAN2_Active = 0u;
+            can2_last_rx_tick = 0u;
+        }
+    }
 }
 
 void App_SetDPTAdcValues(uint16_t ch1, uint16_t ch2)

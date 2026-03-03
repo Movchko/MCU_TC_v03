@@ -12,6 +12,10 @@ void App_Timer1ms(void);
 void App_CanRxPush(uint32_t id, const uint8_t *data);
 void App_CanProcess(void);
 void App_SetDPTAdcValues(uint16_t ch1, uint16_t ch2);
+void App_CanOnRx(uint8_t bus);      /* 1 = CAN1, 2 = CAN2 */
+void App_UpdateCanActivity(void);
+extern volatile uint8_t CAN1_Active;
+extern volatile uint8_t CAN2_Active;
 
 #ifdef __cplusplus
 }
