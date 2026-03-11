@@ -9,7 +9,7 @@ extern "C" {
 
 void App_Init(void);
 void App_Timer1ms(void);
-void App_CanRxPush(uint32_t id, const uint8_t *data);
+void App_CanRxPush(uint32_t id, const uint8_t *data, uint8_t bus);
 void App_CanProcess(void);
 void App_SetDPTAdcValues(uint16_t ch1, uint16_t ch2);
 void App_CanOnRx(uint8_t bus);      /* 1 = CAN1, 2 = CAN2 */

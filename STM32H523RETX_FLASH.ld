@@ -42,10 +42,12 @@ _Min_Heap_Size = 0x200; /* required amount of heap */
 _Min_Stack_Size = 0x400; /* required amount of stack */
 
 /* Memories definition */
+/* FLASH: код и данные — 504K. Последняя страница (8 KB) — область конфигов MKUCfg */
 MEMORY
 {
-  RAM    (xrw)    : ORIGIN = 0x20000000,   LENGTH = 272K
-  FLASH    (rx)    : ORIGIN = 0x08000000,   LENGTH = 512K
+  RAM       (xrw)  : ORIGIN = 0x20000000,   LENGTH = 272K
+  FLASH     (rx)   : ORIGIN = 0x08000000,   LENGTH = 504K
+  FLASH_CFG (r)    : ORIGIN = 0x0807E000,   LENGTH = 8K    /* область конфигов MKUCfg */
 }
 
 /* Sections */
@@ -130,6 +132,18 @@ SECTIONS
     PROVIDE_HIDDEN (__fini_array_end = .);
     . = ALIGN(4);
   } >FLASH
+
+  /* Секция области конфигов MKUCfg — последняя страница Flash (8 KB).
+   * NOLOAD: не загружается при прошивке, читается/пишется в runtime.
+   * Символы _mku_cfg_start, _mku_cfg_end — границы области. */
+  .mku_cfg (NOLOAD) :
+  {
+    . = ALIGN(4);
+    _mku_cfg_start = .;
+    . = . + 0x2000;          /* резерв 8 KB под MKUCfg */
+    . = ALIGN(4);
+    _mku_cfg_end = .;
+  } >FLASH_CFG
 
   /* Used by the startup to initialize data */
   _sidata = LOADADDR(.data);
