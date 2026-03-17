@@ -62,10 +62,15 @@ volatile uint8_t CAN2_Active = 0;
 static uint32_t can1_last_rx_tick = 0;
 static uint32_t can2_last_rx_tick = 0;
 
+/* Напряжения из статуса ППКУ (мВ).
+ * Приоритет: U (power), если оно >= 9 В, иначе U_res (резервное). */
+static uint32_t g_ppky_u_mv    = 24000u;
+static uint32_t g_ppky_ures_mv = 24000u;
+
 
 void RcvStatusFire() {}
-void RcvReplyStatusFire();
-void RcvStartExtinguishment();
+
+
 void RcvStopExtinguishment() {}
 void RcvSetSystemTime(uint8_t *Data) {}
 uint8_t DPT_status = 0;
@@ -323,8 +328,19 @@ void CommandCB(uint8_t Dev, uint8_t Command, uint8_t *Parameters)
 
 void ListenerCommandCB(uint32_t MsgID, uint8_t *MsgData)
 {
-    (void)MsgID;
-    (void)MsgData;
+    can_ext_id_t id;
+    id.ID = MsgID;
+    /* Интересует только статусная посылка от ППКУ (DEVICE_PPKY_TYPE, dir=1, Dev=0, Cmd=0) */
+    if (id.field.d_type == DEVICE_PPKY_TYPE && id.field.dir == 1u && MsgData != NULL) {
+    	uint8_t cmd = MsgData[0];
+    	if (cmd == 0u) {
+    		/* Формат как в ППКУ: status_data[1] = U (0.1 В), status_data[2] = U_res (0.1 В) */
+    		uint8_t u_tenth    = MsgData[2];
+    		uint8_t ures_tenth = MsgData[3];
+    		g_ppky_u_mv    = (uint32_t)u_tenth    * 100u; /* 0.1 В → мВ */
+    		g_ppky_ures_mv = (uint32_t)ures_tenth * 100u;
+    	}
+    }
 }
 
 void App_CanOnRx(uint8_t bus)
@@ -419,7 +435,8 @@ void App_Init(void)
 
     // MAX off, switch to Max On
     App_DPT_SetResMeasureMode();
-
+    extern bool isListener;
+    isListener = true;
 }
 
 void App_Timer1ms(void)
@@ -520,7 +537,7 @@ void App_SetDPTAdcValues(uint16_t ch1, uint16_t ch2)
      */
     const uint32_t VREF_MV = 3300u;      /* опорное напряжение АЦП, мВ */
     const uint32_t ADC_MAX = 4095u;      /* 12-битный АЦП */
-    const uint32_t R0_OHM  = 1925u;       /* ограничительные резисторы 24В→LINE */
+    const uint32_t R0_OHM  = 1925u;       /* ограничительные резисторы 24В→LINE при 24 В */
     const uint32_t DIV_K   = 11u;        /* коэффициент делителя 47к/4.7к */
 
     /* Напряжения на входах АЦП, мВ */
@@ -530,15 +547,43 @@ void App_SetDPTAdcValues(uint16_t ch1, uint16_t ch2)
     /* Напряжения непосредственно на линии, мВ */
     uint32_t v_line_l_mv = v_adc_l_mv * DIV_K;
     uint32_t v_line_h_mv = v_adc_h_mv * DIV_K;
-    if(v_line_l_mv == 0) v_line_l_mv = 1;
+    if (v_line_l_mv == 0u) {
+    	v_line_l_mv = 1u;
+    }
     uint32_t r_line_ohm = 0u;
 
-    /* Защита от деления на ноль и очень маленького напряжения на нижней точке */
+    /* Базовое сопротивление линии по идеальной формуле */
     if (v_line_h_mv > v_line_l_mv) {
         r_line_ohm = R0_OHM * (v_line_h_mv - v_line_l_mv) / v_line_l_mv;
     }
 
-    g_dpt.SetAdcValues((uint16_t)r_line_ohm, 0);
+    /* Эмпирическая коррекция по напряжению питания ППКУ:
+     * хотим, чтобы при 12 В (3100 Ом) и 20 В (1431 Ом) получалось примерно одно и то же значение.
+     *
+     * R_corr = R_meas * ( -0.346 + 0.0673 * U_В )
+     * В целочисленном виде (k_scaled = k * 1000):
+     * k_scaled = -346 + 0.0673 * U_В * 1000 = -346 + 0.0673 * u_src_mv
+     * ≈ -346 + (673 * u_src_mv) / 10000
+     */
+    uint32_t u_src_mv = g_ppky_u_mv;
+    if (u_src_mv < 9000u) {
+    	u_src_mv = g_ppky_ures_mv;
+    }
+    if (u_src_mv < 9000u) {
+    	u_src_mv = 12000u; /* минимально разумное значение, чтобы коэффициент не ушёл в ноль */
+    }
+// ниже перерасчёт по двум точкам (12В и 20В), всё в лаптях для макета
+    int32_t k_scaled = -346;
+    k_scaled += (int32_t)(673u * (u_src_mv / 10u)) / 1000; /* (673 * u_mv / 10000) ≈ 673*(u_mv/10)/1000 */
+
+    /* Ограничиваем коэффициент в разумных пределах: от 0.3 до 1.5 */
+    if (k_scaled < 300)  k_scaled = 300;
+    if (k_scaled > 1500) k_scaled = 1500;
+
+    /* Применяем коррекцию: r_corr = r_line_ohm * k_scaled / 1000 */
+    uint32_t r_corr = (uint32_t)((r_line_ohm * (uint32_t)k_scaled + 500u) / 1000u);
+
+    g_dpt.SetAdcValues((uint16_t)r_corr, 0);
 }
 
 } // extern "C"
