@@ -252,7 +252,7 @@ int main(void)
     static uint32_t last_tick = 0;
     uint32_t now = HAL_GetTick();
     if (now != last_tick) {
-      last_tick = now;
+      last_tick++;
       App_Timer1ms();
     }
   }

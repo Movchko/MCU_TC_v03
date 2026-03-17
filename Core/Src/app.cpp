@@ -62,6 +62,19 @@ volatile uint8_t CAN2_Active = 0;
 static uint32_t can1_last_rx_tick = 0;
 static uint32_t can2_last_rx_tick = 0;
 
+
+void RcvStatusFire() {}
+void RcvReplyStatusFire();
+void RcvStartExtinguishment();
+void RcvStopExtinguishment() {}
+void RcvSetSystemTime(uint8_t *Data) {}
+uint8_t DPT_status = 0;
+
+/* Повторная отправка статуса пожара:
+ * после SetStatusFire() каждые 200 мс до RcvReplyStatusFire() или RcvStartExtinguishment(). */
+static uint8_t  g_fire_retry_active = 0;
+static uint32_t g_fire_last_send_ms = 0;
+
 /* callback статуса: отправляем его через CAN по протоколу backend */
 static void VDeviceSetStatus(uint8_t DNum, uint8_t Code, const uint8_t *Parameters) {
     uint8_t data[7] = {0};
@@ -70,6 +83,32 @@ static void VDeviceSetStatus(uint8_t DNum, uint8_t Code, const uint8_t *Paramete
     }
     /* DNum = 1 для виртуального ДПТ */
     SendMessage(DNum, Code, data, 0, BUS_CAN12);
+
+    extern Device BoardDevicesList[];
+    if (BoardDevicesList[DNum].d_type == DEVICE_DPT_TYPE) {
+    	if ((DPT_status != Code) && (Code == DeviceDPTLineState_Fire)) {
+    		DPT_status = Code;
+    		/* Первая посылка статуса пожара */
+    		SetStatusFire();
+    		/* Запускаем механизм повторной отправки раз в 200 мс,
+    		 * пока не придёт подтверждение или не начнётся тушение. */
+    		g_fire_retry_active = 1;
+    		g_fire_last_send_ms = HAL_GetTick();
+    	}
+    }
+
+}
+
+void RcvReplyStatusFire()
+{
+	/* Пришло подтверждение — останавливаем повторы */
+	g_fire_retry_active = 0;
+}
+
+void RcvStartExtinguishment()
+{
+	/* Началось тушение — дальнейшие повторы статуса пожара не нужны */
+	g_fire_retry_active = 0;
 }
 
 void SetHAdr(uint8_t h_adr) {
@@ -390,17 +429,18 @@ void App_Timer1ms(void)
     static uint16_t status_cnt = 0u;
 //    static uint16_t probe_cnt = 0u;
 
+    uint32_t now = HAL_GetTick();
+
     /* Статус активности МКУ раз в секунду (Dev 0 — плата) */
     if (status_cnt < 1000u) {
         status_cnt++;
     } else {
         status_cnt = 0u;
-        uint32_t tick = HAL_GetTick();
         uint8_t status_data[7] = {
-            (uint8_t)(tick & 0xFFu),
-            (uint8_t)((tick >> 8) & 0xFFu),
-            (uint8_t)((tick >> 16) & 0xFFu),
-            (uint8_t)((tick >> 24) & 0xFFu),
+            (uint8_t)(now & 0xFFu),
+            (uint8_t)((now >> 8) & 0xFFu),
+            (uint8_t)((now >> 16) & 0xFFu),
+            (uint8_t)((now >> 24) & 0xFFu),
             (uint8_t)(CAN1_Active | (CAN2_Active << 1)),
             0u,
             0u
@@ -437,6 +477,15 @@ void App_Timer1ms(void)
 */
     /* Обновляем флаги активности CAN: если 3 секунды тишина — считаем шину неактивной */
     App_UpdateCanActivity();
+
+    /* Повторная отправка статуса пожара при отсутствии подтверждения:
+     * раз в 200 мс, пока не придёт RcvReplyStatusFire() или RcvStartExtinguishment(). */
+    if (g_fire_retry_active) {
+    	if ((uint32_t)(now - g_fire_last_send_ms) >= 200u) {
+    		SetStatusFire();
+    		g_fire_last_send_ms = now;
+    	}
+    }
 
     /* Обновление виртуального ДПТ (1 мс таймер) */
     g_dpt.Timer1ms();
