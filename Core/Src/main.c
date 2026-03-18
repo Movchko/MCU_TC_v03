@@ -108,71 +108,126 @@ void USBSendData(uint8_t *Buf)
   (void)Buf;
 }
 
+typedef struct {
+  uint32_t id;
+  uint8_t  data[8];
+  uint8_t  bus;  /* маска BUS_CAN0/BUS_CAN1 */
+} CanTxEntry;
+
+#define CAN_TX_RING_SIZE  256
+static CanTxEntry can_tx_ring[CAN_TX_RING_SIZE];
+static volatile uint8_t can_tx_head = 0;
+static volatile uint8_t can_tx_tail = 0;
+
+static void CanTxEnqueue(uint32_t id, const uint8_t *data, uint8_t busMask)
+{
+  uint8_t next = (uint8_t)(can_tx_head + 1u);
+  if (next >= CAN_TX_RING_SIZE)
+    next = 0u;
+
+  /* При переполнении затираем самый старый пакет */
+  if (next == can_tx_tail) {
+    can_tx_tail++;
+    if (can_tx_tail >= CAN_TX_RING_SIZE)
+      can_tx_tail = 0u;
+  }
+
+  can_tx_ring[can_tx_head].id  = id;
+  can_tx_ring[can_tx_head].bus = busMask;
+  for (uint8_t i = 0; i < 8u; i++) {
+    can_tx_ring[can_tx_head].data[i] = data[i];
+  }
+  can_tx_head = next;
+}
+
+void App_CanTxProcess(void)
+{
+  while (can_tx_head != can_tx_tail) {
+    CanTxEntry *e = &can_tx_ring[can_tx_tail];
+    FDCAN_TxHeaderTypeDef txHeader;
+
+    txHeader.Identifier = e->id;
+    txHeader.IdType = FDCAN_EXTENDED_ID;
+    txHeader.TxFrameType = FDCAN_DATA_FRAME;
+    txHeader.DataLength = FDCAN_DLC_BYTES_8;
+    txHeader.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
+    txHeader.BitRateSwitch = FDCAN_BRS_OFF;
+    txHeader.FDFormat = FDCAN_CLASSIC_CAN;
+    txHeader.TxEventFifoControl = FDCAN_NO_TX_EVENTS;
+    txHeader.MessageMarker = 0;
+
+    uint8_t sent = 0u;
+
+    if (e->bus & BUS_CAN0) {
+      if (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) > 0U) {
+        if (HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan1, &txHeader, e->data) == HAL_OK) {
+          sent = 1u;
+        }
+      }
+    }
+    if (e->bus & BUS_CAN1) {
+      if (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan2) > 0U) {
+        if (HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan2, &txHeader, e->data) == HAL_OK) {
+          sent = 1u;
+        }
+      }
+    }
+
+    if (sent == 0u) {
+      /* FIFO обоих каналов занято — выходим, попробуем позже */
+      break;
+    }
+
+    /* Успешно отправили хотя бы в один канал — выкидываем элемент из очереди */
+    can_tx_tail++;
+    if (can_tx_tail >= CAN_TX_RING_SIZE)
+      can_tx_tail = 0u;
+  }
+}
+
 void CANSendData(uint8_t *Buf)
 {
-  FDCAN_TxHeaderTypeDef txHeader;
-
-  txHeader.Identifier = (*(uint32_t*)Buf);
-  txHeader.IdType = FDCAN_EXTENDED_ID;
-  txHeader.TxFrameType = FDCAN_DATA_FRAME;
-  txHeader.DataLength = FDCAN_DLC_BYTES_8;
-  txHeader.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
-  txHeader.BitRateSwitch = FDCAN_BRS_OFF;
-  txHeader.FDFormat = FDCAN_CLASSIC_CAN;
-  txHeader.TxEventFifoControl = FDCAN_NO_TX_EVENTS;
-  txHeader.MessageMarker = 0;
+  uint32_t id = (*(uint32_t*)Buf);
   uint8_t bus = Buf[4 + 8]; /* ID + Data */
-  if (bus & BUS_CAN0)
-    HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan1, &txHeader, &Buf[4]);
-  if (bus & BUS_CAN1)
-    HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan2, &txHeader, &Buf[4]);
+  CanTxEnqueue(id, &Buf[4], bus);
 }
 
 void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
 {
-  FDCAN_RxHeaderTypeDef rxHeader;
-  uint8_t data[8];
-
   if ((RxFifo0ITs & FDCAN_IT_RX_FIFO0_NEW_MESSAGE) == 0U)
     return;
 
-  if (HAL_FDCAN_GetRxMessage(hfdcan, FDCAN_RX_FIFO0, &rxHeader, data) != HAL_OK)
-    return;
+  FDCAN_RxHeaderTypeDef rxHeader;
+  uint8_t data[8];
 
-  if (rxHeader.IdType != FDCAN_EXTENDED_ID)
-    return;
+  uint8_t src_bus;
+  uint8_t dst_bus_mask;
+  if (hfdcan == &hfdcan1) {
+    src_bus = BUS_CAN0;
+    dst_bus_mask = BUS_CAN1;
+    App_CanOnRx(1u);
+  } else {
+    src_bus = BUS_CAN1;
+    dst_bus_mask = BUS_CAN0;
+    App_CanOnRx(2u);
+  }
 
-  /* Ретрансляция пакета на другой CAN для работы кольца */
-  {
-    FDCAN_HandleTypeDef *other;
-    FDCAN_TxHeaderTypeDef txHeader;
+  /* Читаем все сообщения из FIFO0 */
+  while (HAL_FDCAN_GetRxFifoFillLevel(hfdcan, FDCAN_RX_FIFO0) > 0U) {
+    if (HAL_FDCAN_GetRxMessage(hfdcan, FDCAN_RX_FIFO0, &rxHeader, data) != HAL_OK)
+      break;
 
-    if (hfdcan == &hfdcan1) {
-      other = &hfdcan2;
-      App_CanOnRx(1u);
-    } else {
-      other = &hfdcan1;
-      App_CanOnRx(2u);
+    if (rxHeader.IdType != FDCAN_EXTENDED_ID)
+      continue;
+
+    /* Ретрансляция пакета на другой CAN через очередь, если разрешено */
+    if (GetRetranslate() == 0) {
+      CanTxEnqueue(rxHeader.Identifier, data, dst_bus_mask);
     }
 
-    txHeader.Identifier = rxHeader.Identifier;
-    txHeader.IdType = rxHeader.IdType;
-    txHeader.TxFrameType = FDCAN_DATA_FRAME;
-    txHeader.DataLength = rxHeader.DataLength;
-    txHeader.ErrorStateIndicator = rxHeader.ErrorStateIndicator;
-    txHeader.BitRateSwitch = rxHeader.BitRateSwitch;
-    txHeader.FDFormat = rxHeader.FDFormat;
-    txHeader.TxEventFifoControl = FDCAN_NO_TX_EVENTS;
-    txHeader.MessageMarker = 0;
-    if(GetRetranslate() == 0) //
-    	(void)HAL_FDCAN_AddMessageToTxFifoQ(other, &txHeader, data);
+    /* Передаём пакет в общий приёмный буфер приложения */
+    App_CanRxPush(rxHeader.Identifier, data, src_bus);
   }
-  uint8_t bus;
-  if (hfdcan == &hfdcan1)
-    bus = BUS_CAN0;
-  else
-    bus = BUS_CAN1;
-  App_CanRxPush(rxHeader.Identifier, data, bus);
 }
 
 /**
@@ -255,6 +310,7 @@ int main(void)
       last_tick++;
       App_Timer1ms();
     }
+    App_CanTxProcess();
   }
   /* USER CODE END 3 */
 }

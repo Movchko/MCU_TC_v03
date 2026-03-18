@@ -44,7 +44,7 @@ static void App_DPT_SetMaxMeasureMode(void)
 }
 
 /* Кольцевой буфер принятых CAN-пакетов */
-#define APP_CAN_RX_RING_SIZE  32
+#define APP_CAN_RX_RING_SIZE  256
 
 typedef struct {
     uint32_t id;
@@ -173,15 +173,15 @@ void DefaultConfig(void)
     /* reserv[64] — отличия платы ТС (пока пусто) */
 }
 
-uint16_t GetConfigSize(void)
+uint32_t GetConfigSize(void)
 {
-    return static_cast<uint16_t>(sizeof(g_cfg));
+    return static_cast<uint32_t>(sizeof(g_cfg));
 }
 
 uint32_t GetConfigWord(uint16_t num)
 {
     uint32_t byte_index = static_cast<uint32_t>(num) * 4u;
-    uint16_t cfg_size   = GetConfigSize();
+    uint32_t cfg_size   = GetConfigSize();
 
     if (byte_index + 4u > cfg_size) {
         return 0u;
@@ -200,7 +200,7 @@ uint32_t GetConfigWord(uint16_t num)
 void SetConfigWord(uint16_t num, uint32_t word)
 {
     uint32_t byte_index = static_cast<uint32_t>(num) * 4u;
-    uint16_t cfg_size   = GetConfigSize();
+    uint32_t cfg_size   = GetConfigSize();
 
     if (byte_index + 4u > cfg_size) {
         return;
@@ -234,7 +234,7 @@ static bool FlashReadConfig(MKUCfg *out)
     return true;
 }
 
-void FlashWriteData(uint8_t *ConfigPtr, uint16_t ConfigSize)
+void FlashWriteData(uint8_t *ConfigPtr, uint32_t ConfigSize)
 {
     if (ConfigPtr == nullptr || ConfigSize != sizeof(MKUCfg) ||
         ConfigSize > FLASH_CFG_SIZE - MKU_CFG_HEADER_SIZE) {
@@ -291,7 +291,7 @@ void FlashWriteData(uint8_t *ConfigPtr, uint16_t ConfigSize)
 
 void SaveConfig(void)
 {
-    uint16_t size = GetConfigSize();
+    uint32_t size = GetConfigSize();
     (void)size;
 
     FlashWriteData(reinterpret_cast<uint8_t *>(&g_cfg), size);
