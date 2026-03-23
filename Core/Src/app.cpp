@@ -15,6 +15,11 @@ extern "C" {
  * адрес и размер — mku_cfg_flash.h (_mku_cfg_start, _mku_cfg_end) */
 #define FLASH_CFG_SECTOR     (31u)         /* последний сектор Bank 2 (0x0807E000); в каждом банке 32 сектора 0–31 */
 #define MKU_CFG_HEADER_MAGIC 0x4D4B5543u   /* 'MKUC' */
+#define MAX_TEMP_SMA_SIZE    10u
+#define MAX_FAULT_MASK_FAULT 0x01u
+#define MAX_FAULT_MASK_SCV   0x02u
+#define MAX_FAULT_MASK_SCG   0x04u
+#define MAX_FAULT_MASK_OC    0x08u
 #include <string.h>
 #include "main.h"
 
@@ -79,6 +84,10 @@ uint8_t DPT_status = 0;
  * после SetStatusFire() каждые 200 мс до RcvReplyStatusFire() или RcvStartExtinguishment(). */
 static uint8_t  g_fire_retry_active = 0;
 static uint32_t g_fire_last_send_ms = 0;
+static int16_t  g_max_temp_sma_buf[MAX_TEMP_SMA_SIZE];
+static int32_t  g_max_temp_sma_sum = 0;
+static uint8_t  g_max_temp_sma_idx = 0;
+static uint8_t  g_max_temp_sma_fill = 0;
 
 /* callback статуса: отправляем его через CAN по протоколу backend */
 static void VDeviceSetStatus(uint8_t DNum, uint8_t Code, const uint8_t *Parameters) {
@@ -477,8 +486,28 @@ void App_Timer1ms(void)
     else {
 		if (MAX31855_ReadTemperature(&t_couple) == HAL_OK) {
 			int16_t tc = (int16_t)t_couple.thermocouple_temp_c;
-			uint8_t fault = t_couple.fault;
-			g_dpt.SetMaxStatus(tc, 0);
+			int16_t ti = (int16_t)t_couple.internal_temp_c;
+			uint8_t fault_mask = 0u;
+			if (t_couple.fault) { fault_mask |= MAX_FAULT_MASK_FAULT; }
+			if (t_couple.scv)   { fault_mask |= MAX_FAULT_MASK_SCV; }
+			if (t_couple.scg)   { fault_mask |= MAX_FAULT_MASK_SCG; }
+			if (t_couple.oc)    { fault_mask |= MAX_FAULT_MASK_OC; }
+			if (g_max_temp_sma_fill == MAX_TEMP_SMA_SIZE) {
+				g_max_temp_sma_sum -= g_max_temp_sma_buf[g_max_temp_sma_idx];
+			} else {
+				g_max_temp_sma_fill++;
+			}
+			g_max_temp_sma_buf[g_max_temp_sma_idx] = tc;
+			g_max_temp_sma_sum += tc;
+			g_max_temp_sma_idx++;
+			if (g_max_temp_sma_idx >= MAX_TEMP_SMA_SIZE) {
+				g_max_temp_sma_idx = 0u;
+			}
+			int16_t tc_avg = tc;
+			if (g_max_temp_sma_fill > 0u) {
+				tc_avg = (int16_t)(g_max_temp_sma_sum / (int32_t)g_max_temp_sma_fill);
+			}
+			g_dpt.SetMaxStatus(tc_avg, fault_mask, ti);
 		}
 		tmax_cnt = 0;
     }
