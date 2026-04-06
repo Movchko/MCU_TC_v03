@@ -20,6 +20,8 @@ extern "C" {
 #define MAX_FAULT_MASK_SCV   0x02u
 #define MAX_FAULT_MASK_SCG   0x04u
 #define MAX_FAULT_MASK_OC    0x08u
+
+
 #include <string.h>
 #include "main.h"
 
@@ -34,11 +36,14 @@ static MKUCfg g_saved_cfg;
 /* Виртуальный датчик ДПТ (Devices[0], Dev=1) */
 static VDeviceDPT g_dpt(1);
 
+uint8_t mes_max_flag = 0;
+
 static void App_DPT_SetResMeasureMode(void)
 {
     /* 24В включены, реле на измерение сопротивления */
     HAL_GPIO_WritePin(SWITCH_GPIO_Port, SWITCH_Pin, GPIO_PIN_RESET);
     HAL_GPIO_WritePin(LINE1_EN_GPIO_Port, LINE1_EN_Pin, GPIO_PIN_SET);
+    mes_max_flag = 0;
 }
 
 static void App_DPT_SetMaxMeasureMode(void)
@@ -46,6 +51,7 @@ static void App_DPT_SetMaxMeasureMode(void)
     /* 24В отключены, реле на измерение линии по MAX */
 	HAL_GPIO_WritePin(LINE1_EN_GPIO_Port, LINE1_EN_Pin, GPIO_PIN_RESET);
     HAL_GPIO_WritePin(SWITCH_GPIO_Port, SWITCH_Pin, GPIO_PIN_SET);
+    mes_max_flag = 1;
 }
 
 /* Кольцевой буфер принятых CAN-пакетов */
@@ -84,10 +90,12 @@ uint8_t DPT_status = 0;
  * после SetStatusFire() каждые 200 мс до RcvReplyStatusFire() или RcvStartExtinguishment(). */
 static uint8_t  g_fire_retry_active = 0;
 static uint32_t g_fire_last_send_ms = 0;
-static int16_t  g_max_temp_sma_buf[MAX_TEMP_SMA_SIZE];
+static int32_t  g_max_temp_sma_buf[MAX_TEMP_SMA_SIZE];
 static int32_t  g_max_temp_sma_sum = 0;
 static uint8_t  g_max_temp_sma_idx = 0;
 static uint8_t  g_max_temp_sma_fill = 0;
+
+
 
 /* callback статуса: отправляем его через CAN по протоколу backend */
 static void VDeviceSetStatus(uint8_t DNum, uint8_t Code, const uint8_t *Parameters) {
@@ -97,18 +105,22 @@ static void VDeviceSetStatus(uint8_t DNum, uint8_t Code, const uint8_t *Paramete
     }
     /* DNum = 1 для виртуального ДПТ */
     SendMessage(DNum, Code, data, 0, BUS_CAN12);
-
+    DeviceDPTLineState state = (DeviceDPTLineState)data[0];
     extern Device BoardDevicesList[];
     if (BoardDevicesList[DNum].d_type == DEVICE_DPT_TYPE) {
-    	if ((DPT_status != Code) && (Code == DeviceDPTLineState_Fire)) {
-    		DPT_status = Code;
-    		/* Первая посылка статуса пожара */
-    		SetStatusFire();
-    		/* Запускаем механизм повторной отправки раз в 200 мс,
-    		 * пока не придёт подтверждение или не начнётся тушение. */
-    		g_fire_retry_active = 1;
-    		g_fire_last_send_ms = HAL_GetTick();
-    	}
+        if (((DPT_status != state) || g_fire_retry_active) && (state == DeviceDPTLineState_Fire)) {
+            DPT_status = state;
+            can_ext_id_t can_id;
+            can_id.ID = 0;
+        	can_id.field.d_type = BoardDevicesList[DNum].d_type & 0x7F;
+        	can_id.field.h_adr = BoardDevicesList[DNum].h_adr;
+        	can_id.field.l_adr = BoardDevicesList[DNum].l_adr & 0x3F;
+        	can_id.field.zone = BoardDevicesList[DNum].zone & 0x7F;
+            uint8_t Data[7] = {(uint8_t)can_id.field.d_type, (uint8_t)can_id.field.l_adr, (uint8_t)can_id.field.zone,0 ,0 ,0, 0};
+            SetStatusFire(Data);
+            g_fire_retry_active = 1u;
+            g_fire_last_send_ms = HAL_GetTick();
+        }
     }
 
 }
@@ -119,8 +131,9 @@ void RcvReplyStatusFire()
 	g_fire_retry_active = 0;
 }
 
-void RcvStartExtinguishment()
+extern "C" void RcvStartExtinguishment(uint8_t *MsgData)
 {
+	(void)MsgData;
 	/* Началось тушение — дальнейшие повторы статуса пожара не нужны */
 	g_fire_retry_active = 0;
 }
@@ -174,9 +187,9 @@ void DefaultConfig(void)
     /*ДПТ config в Devices[0].reserv */
     DeviceDPTConfig *dpt_cfg = reinterpret_cast<DeviceDPTConfig*>(g_cfg.Devices[0].reserv);
     memset(dpt_cfg, 0, sizeof(DeviceDPTConfig));
-    dpt_cfg->mode                  = 1;    // ДПТ
+    dpt_cfg->mode                  = 0;    // ДПТ
     dpt_cfg->use_max               = 1;    // использовать MAX
-    dpt_cfg->max_fire_threshold_c  = 60;   // °C
+    dpt_cfg->max_fire_threshold_c  = 100;   // °C
     dpt_cfg->state_change_delay_ms = 100;  // мс
 
     /* reserv[64] — отличия платы ТС (пока пусто) */
@@ -418,9 +431,21 @@ void App_Init(void)
 	g_dpt.DPT_SetResMeasureMode = App_DPT_SetResMeasureMode;
 	g_dpt.DPT_SetMaxMeasureMode = App_DPT_SetMaxMeasureMode;
 
+    //TODO:: delete!!
+    g_cfg.UId.devId.zone = 1;
+    g_cfg.zone_delay = 5 + g_cfg.UId.devId.zone * 2;
+    g_cfg.module_delay[0] = 0;
+    g_cfg.module_delay[1] = 2;
+    g_cfg.module_delay[2] = 4;
 	DeviceDPTConfig *dpt_cfg = reinterpret_cast<DeviceDPTConfig*>(g_cfg.Devices[0].reserv);
 	dpt_cfg->use_max = 1;
 	dpt_cfg->state_change_delay_ms = 100;
+	dpt_cfg->max_fire_threshold_c = 80;
+	dpt_cfg->mode                  = 0;    // ДПТ
+
+
+
+
 
     g_dpt.Init();
 
@@ -485,29 +510,45 @@ void App_Timer1ms(void)
     	tmax_cnt++;
     else {
 		if (MAX31855_ReadTemperature(&t_couple) == HAL_OK) {
-			int16_t tc = (int16_t)t_couple.thermocouple_temp_c;
-			int16_t ti = (int16_t)t_couple.internal_temp_c;
+			uint8_t valid = 1;
+
+			int32_t tc = (int16_t)t_couple.thermocouple_temp_c;
+			int32_t ti = (int16_t)t_couple.internal_temp_c;
+
 			uint8_t fault_mask = 0u;
 			if (t_couple.fault) { fault_mask |= MAX_FAULT_MASK_FAULT; }
 			if (t_couple.scv)   { fault_mask |= MAX_FAULT_MASK_SCV; }
 			if (t_couple.scg)   { fault_mask |= MAX_FAULT_MASK_SCG; }
 			if (t_couple.oc)    { fault_mask |= MAX_FAULT_MASK_OC; }
-			if (g_max_temp_sma_fill == MAX_TEMP_SMA_SIZE) {
-				g_max_temp_sma_sum -= g_max_temp_sma_buf[g_max_temp_sma_idx];
-			} else {
-				g_max_temp_sma_fill++;
-			}
-			g_max_temp_sma_buf[g_max_temp_sma_idx] = tc;
-			g_max_temp_sma_sum += tc;
-			g_max_temp_sma_idx++;
-			if (g_max_temp_sma_idx >= MAX_TEMP_SMA_SIZE) {
-				g_max_temp_sma_idx = 0u;
-			}
-			int16_t tc_avg = tc;
-			if (g_max_temp_sma_fill > 0u) {
-				tc_avg = (int16_t)(g_max_temp_sma_sum / (int32_t)g_max_temp_sma_fill);
-			}
-			g_dpt.SetMaxStatus(tc_avg, fault_mask, ti);
+
+			if(t_couple.thermocouple_temp_c > 250)
+				valid = 0;//t_couple.thermocouple_temp_c  = g_max_temp_sma_buf[g_max_temp_sma_idx];;
+			else
+			if((g_max_temp_sma_buf[g_max_temp_sma_idx] > 0) && (t_couple.thermocouple_temp_c > (g_max_temp_sma_buf[g_max_temp_sma_idx] + 50)))
+				valid = 0;//t_couple.thermocouple_temp_c  = g_max_temp_sma_buf[g_max_temp_sma_idx];
+
+			if(mes_max_flag == 0)
+				valid = 0;
+
+			if(valid) {
+				if (g_max_temp_sma_fill == MAX_TEMP_SMA_SIZE) {
+					g_max_temp_sma_sum -= g_max_temp_sma_buf[g_max_temp_sma_idx];
+				} else {
+					g_max_temp_sma_fill++;
+				}
+				g_max_temp_sma_buf[g_max_temp_sma_idx] = tc;
+				g_max_temp_sma_sum += tc;
+				g_max_temp_sma_idx++;
+				if (g_max_temp_sma_idx >= MAX_TEMP_SMA_SIZE) {
+					g_max_temp_sma_idx = 0u;
+				}
+				int32_t tc_avg = tc;
+				if (g_max_temp_sma_fill > 0u) {
+					tc_avg = (int16_t)(g_max_temp_sma_sum / (int32_t)g_max_temp_sma_fill);
+				}
+				g_dpt.SetMaxStatus(tc_avg, fault_mask, ti);
+			} else
+				g_dpt.SetMaxStatus(ti, fault_mask, ti);
 		}
 		tmax_cnt = 0;
     }
@@ -523,15 +564,6 @@ void App_Timer1ms(void)
 */
     /* Обновляем флаги активности CAN: если 3 секунды тишина — считаем шину неактивной */
     App_UpdateCanActivity();
-
-    /* Повторная отправка статуса пожара при отсутствии подтверждения:
-     * раз в 200 мс, пока не придёт RcvReplyStatusFire() или RcvStartExtinguishment(). */
-    if (g_fire_retry_active) {
-    	if ((uint32_t)(now - g_fire_last_send_ms) >= 200u) {
-    		SetStatusFire();
-    		g_fire_last_send_ms = now;
-    	}
-    }
 
     /* Обновление виртуального ДПТ (1 мс таймер) */
     g_dpt.Timer1ms();
