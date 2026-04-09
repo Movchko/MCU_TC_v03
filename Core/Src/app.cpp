@@ -16,6 +16,9 @@ extern "C" {
 #define FLASH_CFG_SECTOR     (31u)         /* последний сектор Bank 2 (0x0807E000); в каждом банке 32 сектора 0–31 */
 #define MKU_CFG_HEADER_MAGIC 0x4D4B5543u   /* 'MKUC' */
 #define MAX_TEMP_SMA_SIZE    10u
+#define MAX31855_SWITCH_BLANK_MS 100u
+#define MAX_TC_STEP_LIMIT_C  40
+#define MAX_TC_VALID_STREAK_REQUIRED 2u
 #define MAX_FAULT_MASK_FAULT 0x01u
 #define MAX_FAULT_MASK_SCV   0x02u
 #define MAX_FAULT_MASK_SCG   0x04u
@@ -38,21 +41,7 @@ static VDeviceDPT g_dpt(1);
 
 uint8_t mes_max_flag = 0;
 
-static void App_DPT_SetResMeasureMode(void)
-{
-    /* 24В включены, реле на измерение сопротивления */
-    HAL_GPIO_WritePin(SWITCH_GPIO_Port, SWITCH_Pin, GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(LINE1_EN_GPIO_Port, LINE1_EN_Pin, GPIO_PIN_SET);
-    mes_max_flag = 0;
-}
 
-static void App_DPT_SetMaxMeasureMode(void)
-{
-    /* 24В отключены, реле на измерение линии по MAX */
-	HAL_GPIO_WritePin(LINE1_EN_GPIO_Port, LINE1_EN_Pin, GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(SWITCH_GPIO_Port, SWITCH_Pin, GPIO_PIN_SET);
-    mes_max_flag = 1;
-}
 
 /* Кольцевой буфер принятых CAN-пакетов */
 #define APP_CAN_RX_RING_SIZE  256
@@ -94,8 +83,125 @@ static int32_t  g_max_temp_sma_buf[MAX_TEMP_SMA_SIZE];
 static int32_t  g_max_temp_sma_sum = 0;
 static uint8_t  g_max_temp_sma_idx = 0;
 static uint8_t  g_max_temp_sma_fill = 0;
+static uint32_t g_max_mode_switch_ms = 0u;
+static int16_t  g_tc_hist3[3] = {0, 0, 0};
+static uint8_t  g_tc_hist3_idx = 0u;
+static uint8_t  g_tc_hist3_fill = 0u;
+static int16_t  g_tc_prev_filtered = 0;
+static uint8_t  g_tc_prev_valid = 0u;
+static uint8_t  g_tc_valid_streak = 0u;
+static int16_t	g_tc_prev_val = 0;
+
+static int16_t Median3(int16_t a, int16_t b, int16_t c)
+{
+	if (a > b) { int16_t t = a; a = b; b = t; }
+	if (b > c) { int16_t t = b; b = c; c = t; }
+	if (a > b) { int16_t t = a; a = b; b = t; }
+	return b;
+}
+
+static void App_DPT_SetResMeasureMode(void)
+{
+    /* 24В включены, реле на измерение сопротивления */
+    HAL_GPIO_WritePin(SWITCH_GPIO_Port, SWITCH_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(LINE1_EN_GPIO_Port, LINE1_EN_Pin, GPIO_PIN_SET);
+}
+
+static void App_DPT_SetMaxMeasureMode(void)
+{
+    /* 24В отключены, реле на измерение линии по MAX */
+	HAL_GPIO_WritePin(LINE1_EN_GPIO_Port, LINE1_EN_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(SWITCH_GPIO_Port, SWITCH_Pin, GPIO_PIN_SET);
+    g_max_mode_switch_ms = HAL_GetTick();
+}
+
+void MAXReadProcess() {
+    if (MAX31855_ReadTemperature(&t_couple) == HAL_OK) {
+    	//if(HAL_GPIO_ReadPin(SWITCH_GPIO_Port, SWITCH_Pin) == GPIO_PIN_RESET)
+    	//	t_couple.thermocouple_temp_c = g_max_temp_sma_buf[g_max_temp_sma_idx];
+
+    	//if(t_couple.thermocouple_temp_c > (g_max_temp_sma_buf[g_max_temp_sma_idx] + 100))
+    	//	t_couple.thermocouple_temp_c = g_max_temp_sma_buf[g_max_temp_sma_idx];
+
+    	uint8_t valid = 1;
+
+    	if(HAL_GPIO_ReadPin(SWITCH_GPIO_Port, SWITCH_Pin) == GPIO_PIN_RESET)
+    		valid = 0;
+
+	/* После переключения реле в MAX-режим кратковременно подавляем данные термопары. */
+	if ((HAL_GetTick() - g_max_mode_switch_ms) < MAX31855_SWITCH_BLANK_MS) {
+		valid = 0;
+	}
+
+        int16_t tc = (int16_t)t_couple.thermocouple_temp_c;
+        int16_t ti = (int16_t)t_couple.internal_temp_c;
+        uint8_t fault_mask = 0u;
+        if (t_couple.fault) { fault_mask |= MAX_FAULT_MASK_FAULT; }
+        if (t_couple.scv)   { fault_mask |= MAX_FAULT_MASK_SCV; }
+        if (t_couple.scg)   { fault_mask |= MAX_FAULT_MASK_SCG; }
+        if (t_couple.oc)    { fault_mask |= MAX_FAULT_MASK_OC; }
+
+        //if(t_couple.fault || t_couple.scv || t_couple.scg || t_couple.oc) <<< конкретно в этой плате отключаем эту проверку, т.к косяк в схеме
+        //	valid = 0;
+
+        if (valid) {
+            g_tc_hist3[g_tc_hist3_idx] = tc;
+            g_tc_hist3_idx++;
+            if (g_tc_hist3_idx >= 3u) {
+                g_tc_hist3_idx = 0u;
+            }
+            if (g_tc_hist3_fill < 3u) {
+                g_tc_hist3_fill++;
+            }
+
+            int16_t tc_filtered = tc;
+            if (g_tc_hist3_fill == 3u) {
+                tc_filtered = Median3(g_tc_hist3[0], g_tc_hist3[1], g_tc_hist3[2]);
+            }
+
+            if (!valid) {
+                g_tc_valid_streak = 0u;
+            }
+
+            if (valid) {
+                if (g_tc_valid_streak < 255u) {
+                    g_tc_valid_streak++;
+                }
+                if (g_tc_valid_streak < MAX_TC_VALID_STREAK_REQUIRED) {
+                    valid = 0;
+                } else {
+                    tc = tc_filtered;
+                    g_tc_prev_filtered = tc_filtered;
+                    g_tc_prev_valid = 1u;
+                }
+            }
+        } else
+        	g_tc_valid_streak = 0u;
 
 
+
+        if(valid) {
+			if (g_max_temp_sma_fill == MAX_TEMP_SMA_SIZE) {
+				g_max_temp_sma_sum -= g_max_temp_sma_buf[g_max_temp_sma_idx];
+			} else {
+				g_max_temp_sma_fill++;
+			}
+			g_max_temp_sma_buf[g_max_temp_sma_idx] = tc;
+			g_max_temp_sma_sum += tc;
+			g_max_temp_sma_idx++;
+			if (g_max_temp_sma_idx >= MAX_TEMP_SMA_SIZE) {
+				g_max_temp_sma_idx = 0u;
+			}
+			int16_t tc_avg = tc;
+			if (g_max_temp_sma_fill > 0u) {
+				tc_avg = (int16_t)(g_max_temp_sma_sum / (int32_t)g_max_temp_sma_fill);
+			}
+			g_tc_prev_val = tc_avg;
+			g_dpt.SetMaxStatus(tc_avg, fault_mask, ti);
+        } else
+        	g_dpt.SetMaxStatus(g_tc_prev_val, fault_mask, ti);
+    }
+}
 
 /* callback статуса: отправляем его через CAN по протоколу backend */
 static void VDeviceSetStatus(uint8_t DNum, uint8_t Code, const uint8_t *Parameters) {
@@ -333,11 +439,19 @@ uint32_t GetID(void)
     return (id0 ^ id1 ^ id2);
 }
 
+void MCU_TCCommandCB(uint8_t Command, uint8_t *Parameters) {
+	if(Command == 20) {
+		g_cfg.UId.devId.zone = Parameters[0];
+		SaveConfig();
+	}
+}
+
 void CommandCB(uint8_t Dev, uint8_t Command, uint8_t *Parameters)
 {
     switch (Dev) {
     case 0:
-        /* сервисные команды физической платы — пока заглушка */
+        /* сервисные команды физической платы  */
+    	MCU_TCCommandCB(Command, Parameters);
         break;
     case 1:
         /* команды для виртуального ДПТ */
@@ -432,7 +546,7 @@ void App_Init(void)
 	g_dpt.DPT_SetMaxMeasureMode = App_DPT_SetMaxMeasureMode;
 
     //TODO:: delete!!
-    g_cfg.UId.devId.zone = 1;
+
     g_cfg.zone_delay = 5 + g_cfg.UId.devId.zone * 2;
     g_cfg.module_delay[0] = 0;
     g_cfg.module_delay[1] = 2;
@@ -509,47 +623,7 @@ void App_Timer1ms(void)
     if(tmax_cnt < 100)
     	tmax_cnt++;
     else {
-		if (MAX31855_ReadTemperature(&t_couple) == HAL_OK) {
-			uint8_t valid = 1;
-
-			int32_t tc = (int16_t)t_couple.thermocouple_temp_c;
-			int32_t ti = (int16_t)t_couple.internal_temp_c;
-
-			uint8_t fault_mask = 0u;
-			if (t_couple.fault) { fault_mask |= MAX_FAULT_MASK_FAULT; }
-			if (t_couple.scv)   { fault_mask |= MAX_FAULT_MASK_SCV; }
-			if (t_couple.scg)   { fault_mask |= MAX_FAULT_MASK_SCG; }
-			if (t_couple.oc)    { fault_mask |= MAX_FAULT_MASK_OC; }
-
-			if(t_couple.thermocouple_temp_c > 250)
-				valid = 0;//t_couple.thermocouple_temp_c  = g_max_temp_sma_buf[g_max_temp_sma_idx];;
-			else
-			if((g_max_temp_sma_buf[g_max_temp_sma_idx] > 0) && (t_couple.thermocouple_temp_c > (g_max_temp_sma_buf[g_max_temp_sma_idx] + 50)))
-				valid = 0;//t_couple.thermocouple_temp_c  = g_max_temp_sma_buf[g_max_temp_sma_idx];
-
-			if(mes_max_flag == 0)
-				valid = 0;
-
-			if(valid) {
-				if (g_max_temp_sma_fill == MAX_TEMP_SMA_SIZE) {
-					g_max_temp_sma_sum -= g_max_temp_sma_buf[g_max_temp_sma_idx];
-				} else {
-					g_max_temp_sma_fill++;
-				}
-				g_max_temp_sma_buf[g_max_temp_sma_idx] = tc;
-				g_max_temp_sma_sum += tc;
-				g_max_temp_sma_idx++;
-				if (g_max_temp_sma_idx >= MAX_TEMP_SMA_SIZE) {
-					g_max_temp_sma_idx = 0u;
-				}
-				int32_t tc_avg = tc;
-				if (g_max_temp_sma_fill > 0u) {
-					tc_avg = (int16_t)(g_max_temp_sma_sum / (int32_t)g_max_temp_sma_fill);
-				}
-				g_dpt.SetMaxStatus(tc_avg, fault_mask, ti);
-			} else
-				g_dpt.SetMaxStatus(ti, fault_mask, ti);
-		}
+    	MAXReadProcess();
 		tmax_cnt = 0;
     }
 /*
