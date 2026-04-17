@@ -71,7 +71,13 @@ static uint32_t g_ppky_ures_mv = 24000u;
 void RcvStatusFire() {}
 
 
-void RcvStopExtinguishment() {}
+extern "C" void RcvStopExtinguishment(uint32_t MsgID, uint8_t *MsgData, uint8_t is_mine)
+{
+    (void)MsgID;
+    (void)MsgData;
+    (void)is_mine;
+    /* На MCU_TC нет спичек, команда остановки тушения игнорируется. */
+}
 void RcvSetSystemTime(uint8_t *Data) {}
 uint8_t DPT_status = 0;
 
@@ -237,12 +243,6 @@ void RcvReplyStatusFire()
 	g_fire_retry_active = 0;
 }
 
-extern "C" void RcvStartExtinguishment(uint8_t *MsgData)
-{
-	(void)MsgData;
-	/* Началось тушение — дальнейшие повторы статуса пожара не нужны */
-	g_fire_retry_active = 0;
-}
 
 void SetHAdr(uint8_t h_adr) {
 	g_cfg.UId.devId.h_adr = h_adr;
